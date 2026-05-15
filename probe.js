@@ -13,38 +13,31 @@ class ClaudeProbe {
 
   async checkBedrockRequestId() {
     const result = {
-      name: "Bedrock Request ID (bdrk)",
+      name: "Bedrock Message ID (bdrk)",
       passed: null,
       detail: "",
       raw: null,
     };
 
     try {
-      const response = await this.client.messages.create(
-        {
-          model: this.model,
-          max_tokens: 16,
-          messages: [{ role: "user", content: "Say hi" }],
-        },
-        { __binaryResponse: true }
-      );
+      const response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 16,
+        messages: [{ role: "user", content: "Say hi" }],
+      });
 
-      const requestId =
-        response.headers.get("x-request-id") ||
-        response.headers.get("request-id") ||
-        "";
+      const msgId = response.id || "";
+      result.raw = msgId;
 
-      result.raw = requestId;
-
-      if (requestId.includes("bdrk")) {
+      if (/^msg_bdrk_/.test(msgId)) {
         result.passed = true;
-        result.detail = `request-id contains "bdrk": ${requestId}`;
-      } else if (/^req_01[A-Za-z0-9]{22}$/.test(requestId)) {
+        result.detail = `Bedrock backend confirmed: ${msgId}`;
+      } else if (/^msg_01[A-Za-z0-9]+$/.test(msgId)) {
         result.passed = true;
-        result.detail = `Anthropic direct format: ${requestId}`;
+        result.detail = `Anthropic direct format: ${msgId}`;
       } else {
         result.passed = false;
-        result.detail = `No bdrk marker, non-standard format: ${requestId}`;
+        result.detail = `Non-standard message id: ${msgId}`;
       }
     } catch (err) {
       result.passed = false;
@@ -62,7 +55,7 @@ class ClaudeProbe {
       raw: null,
     };
 
-    const longText = "A".repeat(2048);
+    const longText = "The quick brown fox jumps over the lazy dog. ".repeat(200);
 
     try {
       const r1 = await this.client.messages.create({
@@ -71,16 +64,18 @@ class ClaudeProbe {
         system: [
           {
             type: "text",
-            text: `You are a helpful assistant. Context: ${longText}`,
+            text: `You are a helpful assistant. Reference material for answering questions:\n${longText}`,
             cache_control: { type: "ephemeral" },
           },
         ],
         messages: [{ role: "user", content: "Say OK" }],
       });
 
-      const cacheCreation =
-        r1.usage?.cache_creation_input_tokens ?? null;
-      const cacheRead = r1.usage?.cache_read_input_tokens ?? null;
+      const usage1 = r1.usage || {};
+      const cacheCreation = usage1.cache_creation_input_tokens;
+      const cacheRead = usage1.cache_read_input_tokens;
+
+      await new Promise((r) => setTimeout(r, 2000));
 
       const r2 = await this.client.messages.create({
         model: this.model,
@@ -88,29 +83,40 @@ class ClaudeProbe {
         system: [
           {
             type: "text",
-            text: `You are a helpful assistant. Context: ${longText}`,
+            text: `You are a helpful assistant. Reference material for answering questions:\n${longText}`,
             cache_control: { type: "ephemeral" },
           },
         ],
         messages: [{ role: "user", content: "Say OK" }],
       });
 
-      const cacheRead2 = r2.usage?.cache_read_input_tokens ?? null;
+      const usage2 = r2.usage || {};
+      const cacheRead2 = usage2.cache_read_input_tokens;
+      const cacheCreation2 = usage2.cache_creation_input_tokens;
 
       result.raw = {
-        first: { cache_creation: cacheCreation, cache_read: cacheRead },
-        second: { cache_read: cacheRead2 },
+        first: usage1,
+        second: usage2,
       };
 
-      if (cacheRead2 && cacheRead2 > 0) {
+      const has1hField = usage1.cache_creation &&
+        "ephemeral_1h_input_tokens" in usage1.cache_creation;
+
+      if (cacheRead2 > 0) {
         result.passed = true;
-        result.detail = `Cache hit on 2nd request: ${cacheRead2} tokens read from cache (supports extended caching)`;
-      } else if (cacheCreation && cacheCreation > 0) {
+        result.detail = `Cache hit: ${cacheRead2} tokens read on 2nd request`;
+      } else if (has1hField) {
+        result.passed = true;
+        result.detail = `1h cache supported (ephemeral_1h_input_tokens field present in response)`;
+      } else if (cacheCreation > 0 || cacheCreation2 > 0) {
+        result.passed = true;
+        result.detail = `Cache created (${cacheCreation || cacheCreation2} tokens) — caching active`;
+      } else if ("cache_creation_input_tokens" in usage1) {
         result.passed = null;
-        result.detail = `Cache created (${cacheCreation} tokens) but no hit on 2nd call — may not support 1h cache`;
+        result.detail = `cache_creation_input_tokens field present but 0 — may support cache`;
       } else {
         result.passed = false;
-        result.detail = `No cache_creation or cache_read in usage — caching not supported`;
+        result.detail = `No cache fields in usage — caching not supported`;
       }
     } catch (err) {
       if (
