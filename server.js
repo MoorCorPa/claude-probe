@@ -108,14 +108,63 @@ async function runProbeWithRetry(target) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// --- Auto-disable AWS account when all checks fail (non-network) ---
+
+async function disableAwsAccount() {
+  const actionConfig = config.actions?.disable_account;
+  if (!actionConfig) return;
+
+  const { admin_url, admin_token, account_id, account_body } = actionConfig;
+  if (!admin_url || !admin_token || !account_id) return;
+
+  const url = `${admin_url}/api/v1/admin/accounts/${account_id}`;
+  const body = { ...account_body, status: "inactive" };
+
+  try {
+    const resp = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${admin_token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const status = resp.status;
+    const text = await resp.text();
+    console.log(`[AUTO-DISABLE] Account ${account_id} -> inactive (HTTP ${status}): ${text.slice(0, 200)}`);
+    return status >= 200 && status < 300;
+  } catch (err) {
+    console.error(`[AUTO-DISABLE] Failed: ${err.message}`);
+    return false;
+  }
+}
+
+function shouldAutoDisable(result) {
+  if (!result || result.failed !== result.total) return false;
+  const hasNetworkError = result.checks.some(
+    (c) => c.detail.includes("Connection error") || c.detail.startsWith("Error: fetch") || c.detail.includes("ECONNREFUSED")
+  );
+  return !hasNetworkError;
+}
+
+async function handleProbeResult(result) {
+  if (shouldAutoDisable(result)) {
+    console.log(`[ALERT] All ${result.total} checks FAILED for ${result.target} — triggering auto-disable`);
+    await disableAwsAccount();
+  }
+}
+
 const schedulers = new Map();
 
 function scheduleTarget(target) {
   if (schedulers.has(target.id)) clearInterval(schedulers.get(target.id));
-  const intervalId = setInterval(() => {
+  const intervalId = setInterval(async () => {
     reloadConfig();
     const current = targets.find(t => t.id === target.id);
-    if (current) runProbeWithRetry(current);
+    if (current) {
+      const result = await runProbeWithRetry(current);
+      if (result) await handleProbeResult(result);
+    }
   }, target.intervalMs);
   schedulers.set(target.id, intervalId);
   console.log(`Scheduled ${target.name}: every ${target.intervalMs / 60000}m, keep ${target.maxHistory}, retry ${target.maxRetries}x`);
@@ -123,7 +172,8 @@ function scheduleTarget(target) {
 
 async function startAllProbes() {
   for (const target of targets) {
-    await runProbeWithRetry(target);
+    const result = await runProbeWithRetry(target);
+    if (result) await handleProbeResult(result);
     scheduleTarget(target);
   }
 }
