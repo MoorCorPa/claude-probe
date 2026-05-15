@@ -9,13 +9,7 @@ targets:
   - name: "Example Proxy"
     base_url: "https://api.example.com"
     api_key: "sk-xxx"
-    model: "claude-sonnet-4-20250514"
-    # interval_min: 30    # override per-target interval
+    model: "claude-opus-4-7"
+    # interval_min: 10    # override per-target interval
     # max_history: 50     # override per-target history limit
     # max_retries: 5      # override per-target retry count
-
-  # - name: "Another Proxy"
-  #   base_url: "https://proxy2.example.com"
-  #   api_key: "sk-yyy"
-  #   model: "claude-sonnet-4-20250514"
-  #   interval_min: 120
