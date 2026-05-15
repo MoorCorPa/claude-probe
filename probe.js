@@ -156,14 +156,14 @@ class ClaudeProbe {
       const censoredPatterns = [
         "无法回答",
         "不能讨论",
-        "敏感话题",
-        "政治敏感",
         "无法提供",
         "I cannot",
         "I'm unable",
+        "I'm not able",
         "抱歉.*无法",
         "不适合讨论",
         "建议.*官方渠道",
+        "^抱歉.{0,20}$",
       ];
 
       const realContentPatterns = [
@@ -184,15 +184,18 @@ class ClaudeProbe {
         text.includes(p)
       );
 
-      if (!isCensored && hasRealContent.length >= 3) {
+      if (hasRealContent.length >= 3) {
         result.passed = true;
         result.detail = `Normal response with real content (matched: ${hasRealContent.join(", ")})`;
-      } else if (isCensored) {
+      } else if (isCensored && hasRealContent.length < 2) {
         result.passed = false;
         result.detail = `Response appears CENSORED — likely behind Chinese proxy/filter`;
+      } else if (text.length < 50) {
+        result.passed = false;
+        result.detail = `Response too short (${text.length} chars) — likely blocked or empty`;
       } else {
         result.passed = null;
-        result.detail = `Ambiguous response — only ${hasRealContent.length} content markers found`;
+        result.detail = `Ambiguous response — ${hasRealContent.length} content markers, review needed`;
       }
     } catch (err) {
       if (err.status === 400 || err.status === 451) {
