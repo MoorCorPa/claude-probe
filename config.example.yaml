@@ -13,3 +13,15 @@ targets:
     # interval_min: 10    # override per-target interval
     # max_history: 50     # override per-target history limit
     # max_retries: 5      # override per-target retry count
+
+# Email alert when all probe checks fail (non-network failure)
+actions:
+  email:
+    from: "probe@example.com"
+    to: "admin@example.com"
+    smtp:
+      host: "smtp.example.com"
+      port: 465
+      secure: true
+      user: "probe@example.com"
+      pass: "your-smtp-password"

@@ -108,38 +108,58 @@ async function runProbeWithRetry(target) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// --- Auto-disable AWS account when all checks fail (non-network) ---
+// --- Email alert when all checks fail (non-network) ---
 
-async function disableAwsAccount() {
-  const actionConfig = config.actions?.disable_account;
-  if (!actionConfig) return;
+const nodemailer = require("nodemailer");
 
-  const { admin_url, admin_token, account_id, account_body } = actionConfig;
-  if (!admin_url || !admin_token || !account_id) return;
+function getMailTransporter() {
+  const smtp = config.actions?.email?.smtp;
+  if (!smtp) return null;
+  return nodemailer.createTransport({
+    host: smtp.host,
+    port: smtp.port || 465,
+    secure: smtp.secure !== false,
+    auth: { user: smtp.user, pass: smtp.pass },
+  });
+}
 
-  const url = `${admin_url}/api/v1/admin/accounts/${account_id}`;
-  const body = { ...account_body, status: "inactive" };
+async function sendAlertEmail(result) {
+  const emailConfig = config.actions?.email;
+  if (!emailConfig) return;
+
+  const { from, to, smtp } = emailConfig;
+  if (!smtp || !from || !to) return;
+
+  const transporter = getMailTransporter();
+  if (!transporter) return;
+
+  const checks = result.checks
+    .map((c) => `${c.passed === true ? "PASS" : c.passed === false ? "FAIL" : "WARN"} | ${c.name}\n      ${c.detail}`)
+    .join("\n\n");
+
+  const subject = `[Claude Probe ALERT] ${result.target} — ALL CHECKS FAILED`;
+  const text = `Target: ${result.target}
+Verdict: ${result.verdict.toUpperCase()}
+Time: ${result.timestamp}
+Duration: ${result.duration_ms}ms
+Score: ${result.passed}/${result.total}
+
+--- Check Details ---
+
+${checks}
+
+---
+This is an automated alert from Claude Probe.`;
 
   try {
-    const resp = await fetch(url, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${admin_token}`,
-      },
-      body: JSON.stringify(body),
-    });
-    const status = resp.status;
-    const text = await resp.text();
-    console.log(`[AUTO-DISABLE] Account ${account_id} -> inactive (HTTP ${status}): ${text.slice(0, 200)}`);
-    return status >= 200 && status < 300;
+    await transporter.sendMail({ from, to, subject, text });
+    console.log(`[EMAIL] Alert sent to ${to}`);
   } catch (err) {
-    console.error(`[AUTO-DISABLE] Failed: ${err.message}`);
-    return false;
+    console.error(`[EMAIL] Failed to send: ${err.message}`);
   }
 }
 
-function shouldAutoDisable(result) {
+function shouldAlert(result) {
   if (!result || result.failed !== result.total) return false;
   const hasNetworkError = result.checks.some(
     (c) => c.detail.includes("Connection error") || c.detail.startsWith("Error: fetch") || c.detail.includes("ECONNREFUSED")
@@ -148,9 +168,9 @@ function shouldAutoDisable(result) {
 }
 
 async function handleProbeResult(result) {
-  if (shouldAutoDisable(result)) {
-    console.log(`[ALERT] All ${result.total} checks FAILED for ${result.target} — triggering auto-disable`);
-    await disableAwsAccount();
+  if (shouldAlert(result)) {
+    console.log(`[ALERT] All ${result.total} checks FAILED for ${result.target} — sending email alert`);
+    await sendAlertEmail(result);
   }
 }
 
