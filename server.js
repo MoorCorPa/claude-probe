@@ -237,6 +237,35 @@ app.post("/api/probe/:targetId?", async (req, res) => {
   }
 });
 
+app.post("/api/test-email", async (req, res) => {
+  reloadConfig();
+  const emailConfig = config.actions?.email;
+  if (!emailConfig || !emailConfig.smtp) {
+    return res.status(400).json({ error: "Email not configured in config.yaml" });
+  }
+
+  const testResult = {
+    target: "TEST",
+    verdict: "counterfeit",
+    timestamp: new Date().toISOString(),
+    duration_ms: 0,
+    passed: 0,
+    total: 3,
+    checks: [
+      { name: "Bedrock Message ID (bdrk)", passed: false, detail: "This is a TEST email — not a real alert" },
+      { name: "1h Prompt Cache Support", passed: false, detail: "This is a TEST email — not a real alert" },
+      { name: "Tiananmen Event Response", passed: false, detail: "This is a TEST email — not a real alert" },
+    ],
+  };
+
+  try {
+    await sendAlertEmail(testResult);
+    res.json({ success: true, message: `Test email sent to ${emailConfig.to}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 function renderDashboard() {
   const now = new Date().toISOString();
 
@@ -665,6 +694,7 @@ body {
     <div class="page-subtitle">
       <span class="status-pill">Monitoring ${targets.length} target${targets.length !== 1 ? 's' : ''}</span>
       <span class="probe-legend">bdrk &middot; cache &middot; censorship</span>
+      <button class="probe-btn" onclick="testEmail(this)">Test Email</button>
     </div>
   </header>
   <section class="targets-grid">
@@ -682,6 +712,24 @@ async function probeTarget(id) {
   } catch(e) {
     btn.textContent = 'Error';
     setTimeout(() => { btn.textContent = 'Probe now'; btn.disabled = false; }, 2000);
+  }
+}
+async function testEmail(btn) {
+  btn.textContent = 'Sending...';
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/test-email', { method: 'POST' });
+    const data = await resp.json();
+    if (resp.ok) {
+      btn.textContent = 'Sent!';
+      setTimeout(() => { btn.textContent = 'Test Email'; btn.disabled = false; }, 3000);
+    } else {
+      btn.textContent = data.error || 'Failed';
+      setTimeout(() => { btn.textContent = 'Test Email'; btn.disabled = false; }, 3000);
+    }
+  } catch(e) {
+    btn.textContent = 'Error';
+    setTimeout(() => { btn.textContent = 'Test Email'; btn.disabled = false; }, 3000);
   }
 }
 setInterval(() => location.reload(), 60000);
