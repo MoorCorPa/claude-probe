@@ -3,6 +3,7 @@ const path = require("path");
 const yaml = require("js-yaml");
 const express = require("express");
 const ClaudeProbe = require("./probe");
+const { getAvailableChecks } = require("./probe");
 
 const configPath = path.join(__dirname, "config.yaml");
 const dataDir = path.join(__dirname, "data");
@@ -30,6 +31,7 @@ function parseTargets(config) {
         baseUrl: t.base_url,
         apiKey: t.api_key,
         model,
+        checks: t.checks || null,
         intervalMs: (t.interval_min || defaults.interval_min || 60) * 60 * 1000,
         maxHistory: t.max_history || defaults.max_history || 30,
         maxRetries: t.max_retries || defaults.max_retries || 3,
@@ -91,6 +93,7 @@ async function runProbeWithRetry(target) {
         baseUrl: target.baseUrl,
         apiKey: target.apiKey,
         model: target.model,
+        checks: target.checks,
       });
 
       const result = await probe.runAll();
@@ -812,7 +815,7 @@ body {
     <h1 class="page-title">Claude Probe</h1>
     <div class="page-subtitle">
       <span class="status-pill">Monitoring ${targets.length} target${targets.length !== 1 ? 's' : ''}</span>
-      <span class="probe-legend">bdrk &middot; json &middot; cache &middot; censorship</span>
+      <span class="probe-legend">${getAvailableChecks().join(' &middot; ')}</span>
     </div>
   </header>
   <nav class="tabs-bar">${tabButtons}</nav>
@@ -863,7 +866,8 @@ function getTimeAgo(isoStr) {
 
 app.listen(PORT, () => {
   console.log(`Claude Probe server running at http://localhost:${PORT}`);
-  console.log(`Targets: ${targets.map((t) => `${t.name}/${t.model} (${t.intervalMs / 60000}m)`).join(", ") || "NONE"}`);
+  console.log(`Available checks: ${getAvailableChecks().join(", ")}`);
+  console.log(`Targets: ${targets.map((t) => `${t.name}/${t.model} [${(t.checks || getAvailableChecks()).join(",")}] (${t.intervalMs / 60000}m)`).join(", ") || "NONE"}`);
 
   if (targets.length > 0) startAllProbes();
 });
