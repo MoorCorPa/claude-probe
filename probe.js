@@ -39,8 +39,8 @@ class ClaudeProbe {
         result.passed = true;
         result.detail = `Bedrock backend confirmed: ${msgId}`;
       } else if (/^msg_01[A-Za-z0-9]+$/.test(msgId)) {
-        result.passed = true;
-        result.detail = `Anthropic direct format: ${msgId}`;
+        result.passed = false;
+        result.detail = `Anthropic direct format (not Bedrock): ${msgId}`;
       } else {
         result.passed = false;
         result.detail = `Non-standard message id: ${msgId}`;
