@@ -251,28 +251,41 @@ app.post("/api/probe/:targetId?", async (req, res) => {
 });
 
 function renderDashboard() {
-  const now = new Date().toISOString();
-
-  // Group targets by name for multi-model display
+  // Group targets by name
   const grouped = new Map();
   for (const t of targets) {
     if (!grouped.has(t.name)) grouped.set(t.name, []);
     grouped.get(t.name).push(t);
   }
 
-  const groupCards = [];
-  for (const [name, group] of grouped) {
-    const modelCards = group.map((t) => {
+  const groupNames = [...grouped.keys()];
+
+  // Build tab buttons
+  const tabButtons = groupNames.map((name, i) => {
+    const group = grouped.get(name);
+    const hasFailure = group.some(t => {
+      const r = (history.get(t.id) || [])[0];
+      return r && r.failed > 0;
+    });
+    const dotClass = hasFailure ? "tab-dot-fail" : "tab-dot-ok";
+    return `<button class="tab-btn${i === 0 ? " active" : ""}" data-tab="${i}"><span class="tab-dot ${dotClass}"></span>${name}</button>`;
+  }).join("");
+
+  // Build tab panels
+  const tabPanels = groupNames.map((name, i) => {
+    const group = grouped.get(name);
+    const firstTarget = group[0];
+
+    const modelRows = group.map((t) => {
       const records = history.get(t.id) || [];
       const latest = records[0];
 
       if (!latest) {
-        return `<div class="model-card waiting">
-          <div class="model-header">
-            <span class="model-tag">${t.model}</span>
-            <span class="verdict-tag verdict-pending">PENDING</span>
+        return `<div class="model-row waiting">
+          <div class="model-row-summary">
+            <span class="model-name">${t.model}</span>
+            <span class="model-row-right"><span class="verdict-tag verdict-pending">PENDING</span></span>
           </div>
-          <p class="waiting-msg">Awaiting first probe...</p>
         </div>`;
       }
 
@@ -281,74 +294,63 @@ function renderDashboard() {
         latest.verdict === "suspect" ? "verdict-suspect" :
         latest.verdict === "unavailable" ? "verdict-unavailable" : "verdict-counterfeit";
 
-      const checks = latest.checks
-        .map((c) => {
-          const stateClass = c.passed === true ? "check-pass" : c.passed === false ? "check-fail" : "check-warn";
-          const indicator = c.passed === true ? "PASS" : c.passed === false ? "FAIL" : "WARN";
-          return `<div class="check-item ${stateClass}">
-            <div class="check-indicator">${indicator}</div>
-            <div class="check-body">
-              <span class="check-name">${c.name}</span>
-              <span class="check-detail">${c.detail}</span>
-            </div>
-          </div>`;
-        })
-        .join("");
-
       const timeAgo = getTimeAgo(latest.timestamp);
+      const retryInfo = latest.attempt > 1 ? ` attempt ${latest.attempt}` : "";
+
+      // Expanded detail: checks + raw data + timeline
+      const checks = latest.checks.map((c) => {
+        const stateClass = c.passed === true ? "check-pass" : c.passed === false ? "check-fail" : "check-warn";
+        const indicator = c.passed === true ? "PASS" : c.passed === false ? "FAIL" : "WARN";
+        const rawHtml = c.raw ? `<pre class="check-raw">${escapeHtml(typeof c.raw === "string" ? c.raw : JSON.stringify(c.raw, null, 2))}</pre>` : "";
+        return `<div class="check-item ${stateClass}">
+          <div class="check-indicator">${indicator}</div>
+          <div class="check-body">
+            <span class="check-name">${c.name}</span>
+            <span class="check-detail">${escapeHtml(c.detail)}</span>
+            ${rawHtml}
+          </div>
+        </div>`;
+      }).join("");
 
       const timeline = records.slice(0, 30).map((r) => {
         const cls = r.verdict === "genuine" ? "dot-genuine" : r.verdict === "suspect" ? "dot-suspect" : r.verdict === "unavailable" ? "dot-unavailable" : "dot-counterfeit";
         return `<span class="timeline-dot ${cls}" title="${r.timestamp} — ${r.verdict}"></span>`;
       }).join("");
 
-      const retryInfo = latest.attempt > 1 ? ` (attempt ${latest.attempt})` : "";
-
-      return `<div class="model-card">
-          <div class="model-header">
-            <div class="model-title-group">
-              <span class="model-tag">${t.model}</span>
-              <span class="model-meta">${timeAgo}${retryInfo} &middot; ${latest.duration_ms}ms</span>
+      return `<div class="model-row">
+        <div class="model-row-summary" onclick="this.parentElement.classList.toggle('expanded')">
+          <span class="model-name">${t.model}</span>
+          <span class="model-info">${timeAgo}${retryInfo} &middot; ${latest.duration_ms}ms</span>
+          <span class="verdict-tag ${verdictClass}">${latest.verdict.toUpperCase()}</span>
+          <span class="model-stats">${latest.passed}<span class="sep">/</span>${latest.total}</span>
+          <span class="model-samples">${records.length}<span class="sep">/</span>${t.maxHistory}</span>
+          <span class="expand-icon"></span>
+        </div>
+        <div class="model-row-detail">
+          <div class="detail-section">
+            <div class="detail-metrics">
+              <div class="metric"><span class="metric-value">${latest.passed}<span class="sep">/</span>${latest.total}</span><span class="metric-label">Passed</span></div>
+              <div class="metric"><span class="metric-value">${latest.failed}</span><span class="metric-label">Failed</span></div>
+              <div class="metric"><span class="metric-value">${latest.duration_ms}<span class="unit">ms</span></span><span class="metric-label">Latency</span></div>
+              <div class="metric"><span class="metric-value">${records.length}<span class="sep">/</span>${t.maxHistory}</span><span class="metric-label">Samples</span></div>
             </div>
-            <span class="verdict-tag ${verdictClass}">${latest.verdict.toUpperCase()}</span>
+            <div class="checks-list">${checks}</div>
+            <div class="detail-footer">
+              <div class="timeline">${timeline}</div>
+              <button class="probe-btn" onclick="event.stopPropagation();probeTarget('${t.id}')">Probe now</button>
+            </div>
           </div>
-          <div class="card-metrics">
-            <div class="metric">
-              <span class="metric-value">${latest.passed}<span class="metric-sep">/</span>${latest.total}</span>
-              <span class="metric-label">Passed</span>
-            </div>
-            <div class="metric">
-              <span class="metric-value">${latest.failed}</span>
-              <span class="metric-label">Failed</span>
-            </div>
-            <div class="metric">
-              <span class="metric-value">${records.length}<span class="metric-sep">/</span>${t.maxHistory}</span>
-              <span class="metric-label">Samples</span>
-            </div>
-          </div>
-          <div class="checks-list">${checks}</div>
-          <div class="model-footer">
-            <div class="timeline">${timeline}</div>
-            <button class="probe-btn" onclick="probeTarget('${t.id}')">Probe now</button>
-          </div>
-        </div>`;
+        </div>
+      </div>`;
     }).join("");
 
-    const firstTarget = group[0];
-    const modelCount = group.length;
-
-    groupCards.push(`<article class="target-card">
-      <header class="card-header">
-        <div class="card-title-group">
-          <h2 class="target-name">${name}</h2>
-          <span class="target-meta">${modelCount} model${modelCount > 1 ? "s" : ""} &middot; every ${firstTarget.intervalMs / 60000}m</span>
-        </div>
-      </header>
-      <div class="models-grid">${modelCards}</div>
-    </article>`);
-  }
-
-  const targetCards = groupCards.join("");
+    return `<div class="tab-panel${i === 0 ? " active" : ""}" data-panel="${i}">
+      <div class="panel-header">
+        <span class="panel-meta">every ${firstTarget.intervalMs / 60000}m &middot; ${group.length} model${group.length > 1 ? "s" : ""}</span>
+      </div>
+      <div class="model-list">${modelRows}</div>
+    </div>`;
+  }).join("");
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -400,16 +402,16 @@ body {
 }
 
 .shell {
-  max-width: 1100px;
+  max-width: 960px;
   margin: 0 auto;
   padding: clamp(1.5rem, 4vw, 3rem) clamp(1rem, 3vw, 2rem);
 }
 
 /* --- Header --- */
 .page-header {
-  margin-bottom: clamp(2rem, 5vw, 3.5rem);
+  margin-bottom: 1.5rem;
   border-bottom: 2px solid var(--text-primary);
-  padding-bottom: 1.25rem;
+  padding-bottom: 1rem;
 }
 
 .page-title {
@@ -420,7 +422,7 @@ body {
 }
 
 .page-subtitle {
-  margin-top: 0.5rem;
+  margin-top: 0.4rem;
   display: flex;
   align-items: center;
   gap: 0.75rem;
@@ -442,8 +444,7 @@ body {
 
 .status-pill::before {
   content: '';
-  width: 6px;
-  height: 6px;
+  width: 6px; height: 6px;
   border-radius: 50%;
   background: var(--genuine);
   animation: pulse 2s infinite;
@@ -460,116 +461,155 @@ body {
   font-family: var(--font-mono);
 }
 
-/* --- Target Cards --- */
-.targets-grid {
+/* --- Tabs --- */
+.tabs-bar {
   display: flex;
-  flex-direction: column;
-  gap: 1.5rem;
-}
-
-.target-card {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  padding: clamp(1.25rem, 3vw, 1.75rem);
-  position: relative;
-  transition: border-color 0.2s;
-}
-
-.target-card:hover {
-  border-color: var(--border-strong);
-}
-
-/* Card Header */
-.card-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 1rem;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
   margin-bottom: 1.25rem;
+  overflow-x: auto;
 }
 
-.card-title-group {
+.tab-btn {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.625rem 1rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
   display: flex;
-  flex-direction: column;
-  gap: 0.125rem;
+  align-items: center;
+  gap: 0.4rem;
 }
 
-.target-name {
-  font-size: 1.125rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+.tab-btn:hover { color: var(--text-secondary); }
+.tab-btn.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent);
 }
 
-.target-meta {
+.tab-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.tab-dot-ok { background: var(--genuine); }
+.tab-dot-fail { background: var(--counterfeit); }
+
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.panel-header {
+  margin-bottom: 0.75rem;
+}
+
+.panel-meta {
   font-size: 0.7rem;
   font-family: var(--font-mono);
   color: var(--text-tertiary);
 }
 
-/* --- Models Grid --- */
-.models-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
-  gap: 1rem;
-}
-
-.model-card {
-  background: var(--bg-card);
-  border: 1px solid var(--border);
-  padding: 1rem 1.25rem;
-  transition: border-color 0.2s;
-}
-
-.model-card:hover {
-  border-color: var(--border-strong);
-}
-
-.model-card.waiting {
-  opacity: 0.6;
-}
-
-.waiting-msg {
-  font-size: 0.8rem;
-  color: var(--text-tertiary);
-  font-style: italic;
-  margin-top: 0.5rem;
-}
-
-.model-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 0.75rem;
-  margin-bottom: 0.75rem;
-}
-
-.model-title-group {
+/* --- Model List --- */
+.model-list {
   display: flex;
   flex-direction: column;
-  gap: 0.125rem;
+  gap: 0;
 }
 
-.model-tag {
+.model-row {
+  border: 1px solid var(--border);
+  border-bottom: none;
+  background: var(--bg-elevated);
+  transition: border-color 0.15s;
+}
+
+.model-row:last-child { border-bottom: 1px solid var(--border); }
+.model-row:hover { border-color: var(--border-strong); }
+.model-row + .model-row { margin-top: -1px; }
+
+.model-row.waiting .model-row-summary {
+  opacity: 0.5;
+}
+
+/* Summary row */
+.model-row-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.1s;
+}
+
+.model-row-summary:hover {
+  background: var(--bg-card);
+}
+
+.model-name {
+  font-family: var(--font-mono);
   font-size: 0.8rem;
   font-weight: 600;
-  font-family: var(--font-mono);
   color: var(--text-primary);
-  letter-spacing: -0.01em;
+  min-width: 0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.model-meta {
-  font-size: 0.65rem;
+.model-info {
   font-family: var(--font-mono);
+  font-size: 0.65rem;
   color: var(--text-tertiary);
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.model-stats, .model-samples {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.model-stats .sep, .model-samples .sep { opacity: 0.3; }
+
+.expand-icon {
+  width: 16px; height: 16px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.expand-icon::after {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 6px; height: 6px;
+  border-right: 1.5px solid var(--text-tertiary);
+  border-bottom: 1.5px solid var(--text-tertiary);
+  transform: translate(-50%, -65%) rotate(45deg);
+  transition: transform 0.2s;
+}
+
+.model-row.expanded .expand-icon::after {
+  transform: translate(-50%, -35%) rotate(-135deg);
 }
 
 /* Verdict Tags */
 .verdict-tag {
-  font-size: 0.625rem;
+  font-size: 0.5625rem;
   font-weight: 700;
   font-family: var(--font-mono);
   letter-spacing: 0.08em;
-  padding: 0.25rem 0.5rem;
+  padding: 0.2rem 0.4rem;
   border: 1.5px solid;
   white-space: nowrap;
   flex-shrink: 0;
@@ -581,10 +621,24 @@ body {
 .verdict-unavailable { color: var(--unavailable); background: var(--unavailable-bg); border-color: var(--unavailable-border); }
 .verdict-pending { color: var(--pending); background: var(--pending-bg); border-color: var(--border); }
 
-/* Card Metrics */
-.card-metrics {
+/* --- Expanded Detail --- */
+.model-row-detail {
+  display: none;
+  background: var(--bg-card);
+  border-top: 1px solid var(--border);
+}
+
+.model-row.expanded .model-row-detail {
+  display: block;
+}
+
+.detail-section {
+  padding: 1rem 1.25rem;
+}
+
+.detail-metrics {
   display: flex;
-  gap: clamp(1rem, 3vw, 2rem);
+  gap: 2rem;
   margin-bottom: 1rem;
   padding-bottom: 0.75rem;
   border-bottom: 1px solid var(--border);
@@ -597,29 +651,28 @@ body {
 }
 
 .metric-value {
-  font-size: 1.25rem;
+  font-size: 1.125rem;
   font-weight: 300;
-  letter-spacing: -0.02em;
   font-family: var(--font-mono);
   line-height: 1;
 }
 
-.metric-sep { opacity: 0.3; }
-.metric-unit { font-size: 0.7rem; opacity: 0.5; margin-left: 0.125rem; }
+.metric-value .sep { opacity: 0.3; }
+.metric-value .unit { font-size: 0.65rem; opacity: 0.5; margin-left: 0.125rem; }
 
 .metric-label {
-  font-size: 0.625rem;
+  font-size: 0.6rem;
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-weight: 500;
 }
 
-/* Checks List */
+/* Checks */
 .checks-list {
   display: flex;
   flex-direction: column;
-  gap: 0.375rem;
+  gap: 0.25rem;
   margin-bottom: 0.75rem;
 }
 
@@ -630,7 +683,6 @@ body {
   padding: 0.4rem 0;
   border-bottom: 1px dashed var(--border);
 }
-
 .check-item:last-child { border-bottom: none; }
 
 .check-indicator {
@@ -652,7 +704,7 @@ body {
 .check-body {
   display: flex;
   flex-direction: column;
-  gap: 0.0625rem;
+  gap: 0.125rem;
   min-width: 0;
 }
 
@@ -669,8 +721,24 @@ body {
   line-height: 1.35;
 }
 
-/* Model Footer & Timeline */
-.model-footer {
+.check-raw {
+  font-size: 0.625rem;
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.625rem;
+  margin-top: 0.375rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  line-height: 1.4;
+}
+
+/* Footer & Timeline */
+.detail-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -685,8 +753,7 @@ body {
 }
 
 .timeline-dot {
-  width: 7px;
-  height: 7px;
+  width: 7px; height: 7px;
   border-radius: 1px;
   display: block;
 }
@@ -720,17 +787,8 @@ body {
   border: 1px dashed var(--border-strong);
   padding: 2rem;
 }
-
-.empty-state h3 {
-  font-size: 1rem;
-  margin-bottom: 0.5rem;
-}
-
-.empty-state p {
-  color: var(--text-secondary);
-  font-size: 0.875rem;
-}
-
+.empty-state h3 { font-size: 1rem; margin-bottom: 0.5rem; }
+.empty-state p { color: var(--text-secondary); font-size: 0.875rem; }
 .empty-state code {
   font-family: var(--font-mono);
   font-size: 0.75rem;
@@ -741,9 +799,9 @@ body {
 
 /* --- Responsive --- */
 @media (max-width: 640px) {
-  .card-metrics { gap: 0.75rem; }
-  .metric-value { font-size: 1rem; }
-  .models-grid { grid-template-columns: 1fr; }
+  .model-row-summary { flex-wrap: wrap; gap: 0.4rem; }
+  .model-info { margin-left: 0; }
+  .detail-metrics { gap: 1rem; flex-wrap: wrap; }
   .timeline-dot { width: 5px; height: 5px; }
 }
 </style>
@@ -757,11 +815,18 @@ body {
       <span class="probe-legend">bdrk &middot; json &middot; cache &middot; censorship</span>
     </div>
   </header>
-  <section class="targets-grid">
-    ${targetCards || `<div class="empty-state"><h3>No targets configured</h3><p>Add targets in <code>config.yaml</code> and restart.</p></div>`}
-  </section>
+  <nav class="tabs-bar">${tabButtons}</nav>
+  ${tabPanels || `<div class="empty-state"><h3>No targets configured</h3><p>Add targets in <code>config.yaml</code> and restart.</p></div>`}
 </div>
 <script>
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelector('[data-panel="' + btn.dataset.tab + '"]').classList.add('active');
+  });
+});
 async function probeTarget(id) {
   const btn = event.target;
   btn.textContent = 'Probing...';
@@ -778,6 +843,10 @@ setInterval(() => location.reload(), 60000);
 </script>
 </body>
 </html>`;
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 function getTimeAgo(isoStr) {
