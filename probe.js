@@ -1,5 +1,11 @@
 const Anthropic = require("@anthropic-ai/sdk");
 
+function isTransientError(err) {
+  if ([502, 503, 429, 529].includes(err.status)) return true;
+  const msg = err.message || "";
+  return msg.includes("ECONNREFUSED") || msg.includes("fetch failed") || msg.includes("ETIMEDOUT") || msg.includes("ENOTFOUND");
+}
+
 class ClaudeProbe {
   constructor(config) {
     this.baseUrl = config.baseUrl;
@@ -40,16 +46,73 @@ class ClaudeProbe {
         result.detail = `Non-standard message id: ${msgId}`;
       }
     } catch (err) {
-      result.passed = false;
-      result.detail = `Error: ${err.message}`;
+      if (isTransientError(err)) {
+        result.detail = `Service unavailable (${err.status || err.code || "network"})`;
+      } else {
+        result.passed = false;
+        result.detail = `Error: ${err.message}`;
+      }
     }
 
     return result;
   }
 
-  async checkCacheSupport() {
+  async checkJsonOutput() {
     const result = {
-      name: "1h Prompt Cache Support",
+      name: "JSON Structured Output (tool_use)",
+      passed: null,
+      detail: "",
+      raw: null,
+    };
+
+    try {
+      const response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: 256,
+        tools: [{
+          name: "output_json",
+          description: "Output a structured answer",
+          input_schema: {
+            type: "object",
+            properties: {
+              answer: { type: "string" },
+              confidence: { type: "number" },
+            },
+            required: ["answer", "confidence"],
+          },
+        }],
+        tool_choice: { type: "tool", name: "output_json" },
+        messages: [{ role: "user", content: "What is 2+2?" }],
+      });
+
+      const toolUse = response.content?.find(c => c.type === "tool_use");
+      result.raw = toolUse?.input;
+
+      if (toolUse && typeof toolUse.input?.answer !== "undefined" && typeof toolUse.input?.confidence === "number") {
+        result.passed = true;
+        result.detail = `Tool use OK: ${JSON.stringify(toolUse.input)}`;
+      } else if (toolUse) {
+        result.passed = null;
+        result.detail = `Tool use response partial: ${JSON.stringify(toolUse.input)}`;
+      } else {
+        result.passed = false;
+        result.detail = `No tool_use block in response`;
+      }
+    } catch (err) {
+      if (isTransientError(err)) {
+        result.detail = `Service unavailable (${err.status || err.code || "network"})`;
+      } else {
+        result.passed = false;
+        result.detail = `Error: ${err.message}`;
+      }
+    }
+
+    return result;
+  }
+
+  async checkCacheControlHeader() {
+    const result = {
+      name: "Cache Control Header",
       passed: null,
       detail: "",
       raw: null,
@@ -58,73 +121,40 @@ class ClaudeProbe {
     const longText = "The quick brown fox jumps over the lazy dog. ".repeat(200);
 
     try {
-      const r1 = await this.client.messages.create({
+      const response = await this.client.messages.create({
         model: this.model,
         max_tokens: 16,
-        system: [
-          {
-            type: "text",
-            text: `You are a helpful assistant. Reference material for answering questions:\n${longText}`,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
+        system: [{
+          type: "text",
+          text: `Reference:\n${longText}`,
+          cache_control: { type: "ephemeral" },
+        }],
         messages: [{ role: "user", content: "Say OK" }],
       });
 
-      const usage1 = r1.usage || {};
-      const cacheCreation = usage1.cache_creation_input_tokens;
-      const cacheRead = usage1.cache_read_input_tokens;
+      const usage = response.usage || {};
+      result.raw = usage;
 
-      await new Promise((r) => setTimeout(r, 2000));
+      const hasCacheFields =
+        "cache_creation_input_tokens" in usage ||
+        "cache_read_input_tokens" in usage;
 
-      const r2 = await this.client.messages.create({
-        model: this.model,
-        max_tokens: 16,
-        system: [
-          {
-            type: "text",
-            text: `You are a helpful assistant. Reference material for answering questions:\n${longText}`,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
-        messages: [{ role: "user", content: "Say OK" }],
-      });
-
-      const usage2 = r2.usage || {};
-      const cacheRead2 = usage2.cache_read_input_tokens;
-      const cacheCreation2 = usage2.cache_creation_input_tokens;
-
-      result.raw = {
-        first: usage1,
-        second: usage2,
-      };
-
-      const has1hField = usage1.cache_creation &&
-        "ephemeral_1h_input_tokens" in usage1.cache_creation;
-
-      if (cacheRead2 > 0) {
+      if (hasCacheFields && (usage.cache_creation_input_tokens > 0 || usage.cache_read_input_tokens > 0)) {
         result.passed = true;
-        result.detail = `Cache hit: ${cacheRead2} tokens read on 2nd request`;
-      } else if (has1hField) {
+        result.detail = `Cache active: created=${usage.cache_creation_input_tokens || 0}, read=${usage.cache_read_input_tokens || 0}`;
+      } else if (hasCacheFields) {
         result.passed = true;
-        result.detail = `1h cache supported (ephemeral_1h_input_tokens field present in response)`;
-      } else if (cacheCreation > 0 || cacheCreation2 > 0) {
-        result.passed = true;
-        result.detail = `Cache created (${cacheCreation || cacheCreation2} tokens) — caching active`;
-      } else if ("cache_creation_input_tokens" in usage1) {
-        result.passed = null;
-        result.detail = `cache_creation_input_tokens field present but 0 — may support cache`;
+        result.detail = `Cache fields present (values=0)`;
       } else {
         result.passed = false;
-        result.detail = `No cache fields in usage — caching not supported`;
+        result.detail = `No cache fields in usage — cache_control ignored`;
       }
     } catch (err) {
-      if (
-        err.message?.includes("cache_control") ||
-        err.status === 400
-      ) {
+      if (isTransientError(err)) {
+        result.detail = `Service unavailable (${err.status || err.code || "network"})`;
+      } else if (err.message?.includes("cache_control") || err.status === 400) {
         result.passed = false;
-        result.detail = `Cache not supported: ${err.message}`;
+        result.detail = `Cache control rejected: ${err.message}`;
       } else {
         result.passed = false;
         result.detail = `Error: ${err.message}`;
@@ -204,7 +234,9 @@ class ClaudeProbe {
         result.detail = `Ambiguous response — ${hasRealContent.length} content markers, review needed`;
       }
     } catch (err) {
-      if (err.status === 400 || err.status === 451) {
+      if (isTransientError(err)) {
+        result.detail = `Service unavailable (${err.status || err.code || "network"})`;
+      } else if (err.status === 400 || err.status === 451) {
         result.passed = false;
         result.detail = `Request blocked (HTTP ${err.status}): censorship detected`;
       } else {
@@ -220,16 +252,19 @@ class ClaudeProbe {
     const startTime = Date.now();
     const results = await Promise.all([
       this.checkBedrockRequestId(),
-      this.checkCacheSupport(),
+      this.checkJsonOutput(),
+      this.checkCacheControlHeader(),
       this.checkCensorshipBypass(),
     ]);
     const duration = Date.now() - startTime;
 
     const passedCount = results.filter((r) => r.passed === true).length;
     const failedCount = results.filter((r) => r.passed === false).length;
+    const warnCount = results.filter((r) => r.passed === null).length;
 
     let verdict = "genuine";
-    if (failedCount >= 2) verdict = "counterfeit";
+    if (failedCount === 0 && warnCount === results.length) verdict = "unavailable";
+    else if (failedCount >= 2) verdict = "counterfeit";
     else if (failedCount === 1) verdict = "suspect";
 
     return {

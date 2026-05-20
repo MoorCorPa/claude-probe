@@ -16,16 +16,27 @@ function loadConfig() {
 
 function parseTargets(config) {
   const defaults = config.server || {};
-  return (config.targets || []).map((t, i) => ({
-    id: t.id || `target_${i + 1}`,
-    name: t.name || `Target ${i + 1}`,
-    baseUrl: t.base_url,
-    apiKey: t.api_key,
-    model: t.model || "claude-sonnet-4-20250514",
-    intervalMs: (t.interval_min || defaults.interval_min || 60) * 60 * 1000,
-    maxHistory: t.max_history || defaults.max_history || 30,
-    maxRetries: t.max_retries || defaults.max_retries || 3,
-  }));
+  const rawTargets = config.targets || [];
+  const result = [];
+
+  for (const t of rawTargets) {
+    const models = t.models || (t.model ? [t.model] : ["claude-sonnet-4-20250514"]);
+    for (const model of models) {
+      const baseId = t.id || t.name || "target";
+      const id = models.length > 1 ? `${baseId}_${model.replace(/[^a-zA-Z0-9]/g, "_")}` : (t.id || `target_${result.length + 1}`);
+      result.push({
+        id,
+        name: t.name || `Target ${result.length + 1}`,
+        baseUrl: t.base_url,
+        apiKey: t.api_key,
+        model,
+        intervalMs: (t.interval_min || defaults.interval_min || 60) * 60 * 1000,
+        maxHistory: t.max_history || defaults.max_history || 30,
+        maxRetries: t.max_retries || defaults.max_retries || 3,
+      });
+    }
+  }
+  return result;
 }
 
 let config = loadConfig();
@@ -85,6 +96,7 @@ async function runProbeWithRetry(target) {
       const result = await probe.runAll();
       result.target = target.name;
       result.targetId = target.id;
+      result.model = target.model;
       result.attempt = attempt;
 
       if (!history.has(target.id)) history.set(target.id, []);
@@ -93,7 +105,7 @@ async function runProbeWithRetry(target) {
       while (arr.length > target.maxHistory) arr.pop();
 
       console.log(
-        `[${result.timestamp}] ${target.name}: ${result.verdict} (${result.passed}/${result.total}, ${result.duration_ms}ms, attempt ${attempt})`
+        `[${result.timestamp}] ${target.name} (${target.model}): ${result.verdict} (${result.passed}/${result.total}, ${result.duration_ms}ms, attempt ${attempt})`
       );
       saveHistory();
       return result;
@@ -137,8 +149,11 @@ async function sendAlertEmail(result) {
     .map((c) => `${c.passed === true ? "PASS" : c.passed === false ? "FAIL" : "WARN"} | ${c.name}\n      ${c.detail}`)
     .join("\n\n");
 
-  const subject = `[Claude Probe ALERT] ${result.target} — ALL CHECKS FAILED`;
+  const failedChecks = result.checks.filter(c => c.passed === false);
+  const failedNames = failedChecks.map(c => c.name).join(", ");
+  const subject = `[Claude Probe ALERT] ${result.target} (${result.model || "?"}) — ${failedChecks.length} check${failedChecks.length > 1 ? "s" : ""} FAILED`;
   const text = `Target: ${result.target}
+Model: ${result.model || "unknown"}
 Verdict: ${result.verdict.toUpperCase()}
 Time: ${result.timestamp}
 Duration: ${result.duration_ms}ms
@@ -160,16 +175,13 @@ This is an automated alert from Claude Probe.`;
 }
 
 function shouldAlert(result) {
-  if (!result || result.failed !== result.total) return false;
-  const hasNetworkError = result.checks.some(
-    (c) => c.detail.includes("Connection error") || c.detail.startsWith("Error: fetch") || c.detail.includes("ECONNREFUSED")
-  );
-  return !hasNetworkError;
+  if (!result || result.verdict === "unavailable") return false;
+  return result.failed > 0;
 }
 
 async function handleProbeResult(result) {
   if (shouldAlert(result)) {
-    console.log(`[ALERT] All ${result.total} checks FAILED for ${result.target} — sending email alert`);
+    console.log(`[ALERT] ${result.failed} check(s) FAILED for ${result.target} (${result.model}) — sending email alert`);
     await sendAlertEmail(result);
   }
 }
@@ -187,7 +199,7 @@ function scheduleTarget(target) {
     }
   }, target.intervalMs);
   schedulers.set(target.id, intervalId);
-  console.log(`Scheduled ${target.name}: every ${target.intervalMs / 60000}m, keep ${target.maxHistory}, retry ${target.maxRetries}x`);
+  console.log(`Scheduled ${target.name} (${target.model}): every ${target.intervalMs / 60000}m, keep ${target.maxHistory}, retry ${target.maxRetries}x`);
 }
 
 async function startAllProbes() {
@@ -210,6 +222,7 @@ app.get("/api/status", (req, res) => {
     const records = history.get(target.id) || [];
     status[target.id] = {
       name: target.name,
+      model: target.model,
       latest: records[0] || null,
       history_count: records.length,
     };
@@ -237,56 +250,36 @@ app.post("/api/probe/:targetId?", async (req, res) => {
   }
 });
 
-app.post("/api/test-email", async (req, res) => {
-  reloadConfig();
-  const emailConfig = config.actions?.email;
-  if (!emailConfig || !emailConfig.smtp) {
-    return res.status(400).json({ error: "Email not configured in config.yaml" });
-  }
-
-  const testResult = {
-    target: "TEST",
-    verdict: "counterfeit",
-    timestamp: new Date().toISOString(),
-    duration_ms: 0,
-    passed: 0,
-    total: 3,
-    checks: [
-      { name: "Bedrock Message ID (bdrk)", passed: false, detail: "This is a TEST email — not a real alert" },
-      { name: "1h Prompt Cache Support", passed: false, detail: "This is a TEST email — not a real alert" },
-      { name: "Tiananmen Event Response", passed: false, detail: "This is a TEST email — not a real alert" },
-    ],
-  };
-
-  try {
-    await sendAlertEmail(testResult);
-    res.json({ success: true, message: `Test email sent to ${emailConfig.to}` });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 function renderDashboard() {
   const now = new Date().toISOString();
 
-  const targetCards = targets
-    .map((t) => {
+  // Group targets by name for multi-model display
+  const grouped = new Map();
+  for (const t of targets) {
+    if (!grouped.has(t.name)) grouped.set(t.name, []);
+    grouped.get(t.name).push(t);
+  }
+
+  const groupCards = [];
+  for (const [name, group] of grouped) {
+    const modelCards = group.map((t) => {
       const records = history.get(t.id) || [];
       const latest = records[0];
 
       if (!latest) {
-        return `<article class="target-card waiting">
-          <header class="card-header">
-            <h2 class="target-name">${t.name}</h2>
+        return `<div class="model-card waiting">
+          <div class="model-header">
+            <span class="model-tag">${t.model}</span>
             <span class="verdict-tag verdict-pending">PENDING</span>
-          </header>
-          <p class="waiting-msg">Awaiting first probe cycle...</p>
-        </article>`;
+          </div>
+          <p class="waiting-msg">Awaiting first probe...</p>
+        </div>`;
       }
 
       const verdictClass =
         latest.verdict === "genuine" ? "verdict-genuine" :
-        latest.verdict === "suspect" ? "verdict-suspect" : "verdict-counterfeit";
+        latest.verdict === "suspect" ? "verdict-suspect" :
+        latest.verdict === "unavailable" ? "verdict-unavailable" : "verdict-counterfeit";
 
       const checks = latest.checks
         .map((c) => {
@@ -305,28 +298,28 @@ function renderDashboard() {
       const timeAgo = getTimeAgo(latest.timestamp);
 
       const timeline = records.slice(0, 30).map((r) => {
-        const cls = r.verdict === "genuine" ? "dot-genuine" : r.verdict === "suspect" ? "dot-suspect" : "dot-counterfeit";
+        const cls = r.verdict === "genuine" ? "dot-genuine" : r.verdict === "suspect" ? "dot-suspect" : r.verdict === "unavailable" ? "dot-unavailable" : "dot-counterfeit";
         return `<span class="timeline-dot ${cls}" title="${r.timestamp} — ${r.verdict}"></span>`;
       }).join("");
 
       const retryInfo = latest.attempt > 1 ? ` (attempt ${latest.attempt})` : "";
 
-      return `<article class="target-card">
-          <header class="card-header">
-            <div class="card-title-group">
-              <h2 class="target-name">${t.name}</h2>
-              <span class="target-meta">${t.model} &middot; every ${t.intervalMs / 60000}m &middot; ${timeAgo}${retryInfo}</span>
+      return `<div class="model-card">
+          <div class="model-header">
+            <div class="model-title-group">
+              <span class="model-tag">${t.model}</span>
+              <span class="model-meta">${timeAgo}${retryInfo} &middot; ${latest.duration_ms}ms</span>
             </div>
             <span class="verdict-tag ${verdictClass}">${latest.verdict.toUpperCase()}</span>
-          </header>
+          </div>
           <div class="card-metrics">
             <div class="metric">
               <span class="metric-value">${latest.passed}<span class="metric-sep">/</span>${latest.total}</span>
-              <span class="metric-label">Checks passed</span>
+              <span class="metric-label">Passed</span>
             </div>
             <div class="metric">
-              <span class="metric-value">${latest.duration_ms}<span class="metric-unit">ms</span></span>
-              <span class="metric-label">Latency</span>
+              <span class="metric-value">${latest.failed}</span>
+              <span class="metric-label">Failed</span>
             </div>
             <div class="metric">
               <span class="metric-value">${records.length}<span class="metric-sep">/</span>${t.maxHistory}</span>
@@ -334,13 +327,28 @@ function renderDashboard() {
             </div>
           </div>
           <div class="checks-list">${checks}</div>
-          <footer class="card-footer">
+          <div class="model-footer">
             <div class="timeline">${timeline}</div>
             <button class="probe-btn" onclick="probeTarget('${t.id}')">Probe now</button>
-          </footer>
-        </article>`;
-    })
-    .join("");
+          </div>
+        </div>`;
+    }).join("");
+
+    const firstTarget = group[0];
+    const modelCount = group.length;
+
+    groupCards.push(`<article class="target-card">
+      <header class="card-header">
+        <div class="card-title-group">
+          <h2 class="target-name">${name}</h2>
+          <span class="target-meta">${modelCount} model${modelCount > 1 ? "s" : ""} &middot; every ${firstTarget.intervalMs / 60000}m</span>
+        </div>
+      </header>
+      <div class="models-grid">${modelCards}</div>
+    </article>`);
+  }
+
+  const targetCards = groupCards.join("");
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -355,6 +363,7 @@ function renderDashboard() {
 :root {
   --bg: #101014;
   --bg-elevated: #1a1a20;
+  --bg-card: #16161c;
   --border: #2a2a32;
   --border-strong: #3a3a44;
   --text-primary: #e4e2de;
@@ -369,6 +378,9 @@ function renderDashboard() {
   --counterfeit: #f87171;
   --counterfeit-bg: #2a0a0a;
   --counterfeit-border: #991b1b;
+  --unavailable: #818cf8;
+  --unavailable-bg: #1e1b3a;
+  --unavailable-border: #4338ca;
   --pending: #5c5a56;
   --pending-bg: #1e1e24;
   --accent: #e87b4a;
@@ -388,7 +400,7 @@ body {
 }
 
 .shell {
-  max-width: 960px;
+  max-width: 1100px;
   margin: 0 auto;
   padding: clamp(1.5rem, 4vw, 3rem) clamp(1rem, 3vw, 2rem);
 }
@@ -467,17 +479,6 @@ body {
   border-color: var(--border-strong);
 }
 
-.target-card.waiting {
-  opacity: 0.6;
-}
-
-.waiting-msg {
-  font-size: 0.875rem;
-  color: var(--text-tertiary);
-  font-style: italic;
-  margin-top: 0.75rem;
-}
-
 /* Card Header */
 .card-header {
   display: flex;
@@ -505,38 +506,98 @@ body {
   color: var(--text-tertiary);
 }
 
+/* --- Models Grid --- */
+.models-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
+  gap: 1rem;
+}
+
+.model-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  padding: 1rem 1.25rem;
+  transition: border-color 0.2s;
+}
+
+.model-card:hover {
+  border-color: var(--border-strong);
+}
+
+.model-card.waiting {
+  opacity: 0.6;
+}
+
+.waiting-msg {
+  font-size: 0.8rem;
+  color: var(--text-tertiary);
+  font-style: italic;
+  margin-top: 0.5rem;
+}
+
+.model-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.model-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
+.model-tag {
+  font-size: 0.8rem;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.model-meta {
+  font-size: 0.65rem;
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+}
+
 /* Verdict Tags */
 .verdict-tag {
-  font-size: 0.6875rem;
+  font-size: 0.625rem;
   font-weight: 700;
   font-family: var(--font-mono);
   letter-spacing: 0.08em;
-  padding: 0.3rem 0.625rem;
+  padding: 0.25rem 0.5rem;
   border: 1.5px solid;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .verdict-genuine { color: var(--genuine); background: var(--genuine-bg); border-color: var(--genuine-border); }
 .verdict-suspect { color: var(--suspect); background: var(--suspect-bg); border-color: var(--suspect-border); }
 .verdict-counterfeit { color: var(--counterfeit); background: var(--counterfeit-bg); border-color: var(--counterfeit-border); }
+.verdict-unavailable { color: var(--unavailable); background: var(--unavailable-bg); border-color: var(--unavailable-border); }
 .verdict-pending { color: var(--pending); background: var(--pending-bg); border-color: var(--border); }
 
 /* Card Metrics */
 .card-metrics {
   display: flex;
-  gap: clamp(1.5rem, 4vw, 3rem);
-  margin-bottom: 1.5rem;
-  padding-bottom: 1.25rem;
+  gap: clamp(1rem, 3vw, 2rem);
+  margin-bottom: 1rem;
+  padding-bottom: 0.75rem;
   border-bottom: 1px solid var(--border);
 }
 
 .metric {
   display: flex;
   flex-direction: column;
-  gap: 0.125rem;
+  gap: 0.0625rem;
 }
 
 .metric-value {
-  font-size: 1.5rem;
+  font-size: 1.25rem;
   font-weight: 300;
   letter-spacing: -0.02em;
   font-family: var(--font-mono);
@@ -544,10 +605,10 @@ body {
 }
 
 .metric-sep { opacity: 0.3; }
-.metric-unit { font-size: 0.75rem; opacity: 0.5; margin-left: 0.125rem; }
+.metric-unit { font-size: 0.7rem; opacity: 0.5; margin-left: 0.125rem; }
 
 .metric-label {
-  font-size: 0.6875rem;
+  font-size: 0.625rem;
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -558,30 +619,30 @@ body {
 .checks-list {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  margin-bottom: 1.25rem;
+  gap: 0.375rem;
+  margin-bottom: 0.75rem;
 }
 
 .check-item {
   display: flex;
   align-items: flex-start;
-  gap: 0.75rem;
-  padding: 0.625rem 0;
+  gap: 0.625rem;
+  padding: 0.4rem 0;
   border-bottom: 1px dashed var(--border);
 }
 
 .check-item:last-child { border-bottom: none; }
 
 .check-indicator {
-  font-size: 0.5625rem;
+  font-size: 0.5rem;
   font-weight: 700;
   font-family: var(--font-mono);
   letter-spacing: 0.1em;
-  padding: 0.2rem 0.4rem;
-  min-width: 3rem;
+  padding: 0.15rem 0.35rem;
+  min-width: 2.75rem;
   text-align: center;
   flex-shrink: 0;
-  margin-top: 0.125rem;
+  margin-top: 0.1rem;
 }
 
 .check-pass .check-indicator { color: var(--genuine); background: var(--genuine-bg); border: 1px solid var(--genuine-border); }
@@ -591,41 +652,41 @@ body {
 .check-body {
   display: flex;
   flex-direction: column;
-  gap: 0.125rem;
+  gap: 0.0625rem;
   min-width: 0;
 }
 
 .check-name {
-  font-size: 0.8125rem;
+  font-size: 0.75rem;
   font-weight: 500;
 }
 
 .check-detail {
-  font-size: 0.75rem;
+  font-size: 0.675rem;
   color: var(--text-secondary);
   font-family: var(--font-mono);
   word-break: break-word;
-  line-height: 1.4;
+  line-height: 1.35;
 }
 
-/* Card Footer & Timeline */
-.card-footer {
+/* Model Footer & Timeline */
+.model-footer {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding-top: 1rem;
+  padding-top: 0.625rem;
   border-top: 1px solid var(--border);
 }
 
 .timeline {
   display: flex;
-  gap: 3px;
+  gap: 2px;
   align-items: center;
 }
 
 .timeline-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 1px;
   display: block;
 }
@@ -633,16 +694,17 @@ body {
 .dot-genuine { background: var(--genuine); }
 .dot-suspect { background: var(--suspect); }
 .dot-counterfeit { background: var(--counterfeit); }
+.dot-unavailable { background: var(--unavailable); }
 
 .probe-btn {
   font-family: var(--font-mono);
-  font-size: 0.6875rem;
+  font-size: 0.625rem;
   font-weight: 500;
   letter-spacing: 0.04em;
   color: var(--text-secondary);
   background: none;
   border: 1px solid var(--border);
-  padding: 0.375rem 0.75rem;
+  padding: 0.3rem 0.6rem;
   cursor: pointer;
   transition: all 0.15s;
 }
@@ -655,7 +717,6 @@ body {
 /* --- Empty State --- */
 .empty-state {
   text-align: left;
-  padding: 3rem 0;
   border: 1px dashed var(--border-strong);
   padding: 2rem;
 }
@@ -680,10 +741,10 @@ body {
 
 /* --- Responsive --- */
 @media (max-width: 640px) {
-  .card-metrics { gap: 1rem; }
-  .metric-value { font-size: 1.25rem; }
-  .card-header { flex-direction: column; gap: 0.5rem; }
-  .timeline-dot { width: 6px; height: 6px; }
+  .card-metrics { gap: 0.75rem; }
+  .metric-value { font-size: 1rem; }
+  .models-grid { grid-template-columns: 1fr; }
+  .timeline-dot { width: 5px; height: 5px; }
 }
 </style>
 </head>
@@ -693,8 +754,7 @@ body {
     <h1 class="page-title">Claude Probe</h1>
     <div class="page-subtitle">
       <span class="status-pill">Monitoring ${targets.length} target${targets.length !== 1 ? 's' : ''}</span>
-      <span class="probe-legend">bdrk &middot; cache &middot; censorship</span>
-      <button class="probe-btn" onclick="testEmail(this)">Test Email</button>
+      <span class="probe-legend">bdrk &middot; json &middot; cache &middot; censorship</span>
     </div>
   </header>
   <section class="targets-grid">
@@ -712,24 +772,6 @@ async function probeTarget(id) {
   } catch(e) {
     btn.textContent = 'Error';
     setTimeout(() => { btn.textContent = 'Probe now'; btn.disabled = false; }, 2000);
-  }
-}
-async function testEmail(btn) {
-  btn.textContent = 'Sending...';
-  btn.disabled = true;
-  try {
-    const resp = await fetch('/api/test-email', { method: 'POST' });
-    const data = await resp.json();
-    if (resp.ok) {
-      btn.textContent = 'Sent!';
-      setTimeout(() => { btn.textContent = 'Test Email'; btn.disabled = false; }, 3000);
-    } else {
-      btn.textContent = data.error || 'Failed';
-      setTimeout(() => { btn.textContent = 'Test Email'; btn.disabled = false; }, 3000);
-    }
-  } catch(e) {
-    btn.textContent = 'Error';
-    setTimeout(() => { btn.textContent = 'Test Email'; btn.disabled = false; }, 3000);
   }
 }
 setInterval(() => location.reload(), 60000);
@@ -752,7 +794,7 @@ function getTimeAgo(isoStr) {
 
 app.listen(PORT, () => {
   console.log(`Claude Probe server running at http://localhost:${PORT}`);
-  console.log(`Targets: ${targets.map((t) => `${t.name} (${t.intervalMs / 60000}m)`).join(", ") || "NONE"}`);
+  console.log(`Targets: ${targets.map((t) => `${t.name}/${t.model} (${t.intervalMs / 60000}m)`).join(", ") || "NONE"}`);
 
   if (targets.length > 0) startAllProbes();
 });
